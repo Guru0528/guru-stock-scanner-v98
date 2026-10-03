@@ -468,7 +468,7 @@ def close_scan():
     summary=pd.DataFrame({"항목":["검색대상","상품제외","API성공","API실패","지표계산성공","최종후보","TOP출력"],"수량":[len(u),excluded,ok,fail,ind,pas,len(top)]})
     reasons=allx.fail_reason.fillna("").replace("","PASS").value_counts().reset_index() if not allx.empty else pd.DataFrame(columns=["탈락사유","건수"])
     if len(reasons.columns)==2:reasons.columns=["탈락사유","건수"]
-    mode_tag=os.getenv("SCANNER_MODE","CLOSE").upper(); path=RESULTS/f"Guru_Stock_Scanner_V10_{mode_tag}_{STAMP}.xlsx"
+    mode_tag=os.getenv("SCANNER_MODE","CLOSE").upper(); path=RESULTS/f"Guru_Stock_Scanner_V9_8_CLOSE__{mode_tag}_{STAMP}.xlsx"
     with pd.ExcelWriter(path,engine="openpyxl") as w:
         topkr.to_excel(w,index=False,sheet_name="TOP10_한눈에보기");det.to_excel(w,index=False,sheet_name="상세분석")
         summary.to_excel(w,index=False,sheet_name="실행요약");reasons.to_excel(w,index=False,sheet_name="탈락사유")
@@ -521,10 +521,10 @@ def current_price(code, tk):
     except Exception as e:return None,repr(e)
 
 def latest_close_result():
-    files=sorted(RESULTS.glob("Guru_Stock_Scanner_V10_*CLOSE*.xlsx"),key=lambda p:p.stat().st_mtime,reverse=True)
+    files=sorted(RESULTS.glob("Guru_Stock_Scanner_V9_8_CLOSE__*CLOSE*.xlsx"),key=lambda p:p.stat().st_mtime,reverse=True)
     if not files:
         # compatibility: close_scan filename may not contain CLOSE in older runs
-        files=sorted(RESULTS.glob("Guru_Stock_Scanner_V10_MULTI_*.xlsx"),key=lambda p:p.stat().st_mtime,reverse=True)
+        files=sorted(RESULTS.glob("Guru_Stock_Scanner_V9_8_CLOSE__MULTI_*.xlsx"),key=lambda p:p.stat().st_mtime,reverse=True)
     return files[0] if files else None
 
 def after_scan():
@@ -555,7 +555,7 @@ def after_scan():
                      "종가대비등락률":chg,"애프터판정":judge,"추천보유유형":r.get("추천보유유형"),
                      "선정전략":r.get("선정전략"),"API메시지":msg})
     out=pd.DataFrame(rows)
-    path=RESULTS/f"Guru_Stock_Scanner_V10_AFTER_{STAMP}.xlsx"
+    path=RESULTS/f"Guru_Stock_Scanner_V9_8_CLOSE__AFTER_{STAMP}.xlsx"
     with pd.ExcelWriter(path,engine="openpyxl") as w:
         out.to_excel(w,index=False,sheet_name="애프터확인")
         top.to_excel(w,index=False,sheet_name="장마감TOP10")
