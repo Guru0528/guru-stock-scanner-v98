@@ -93,8 +93,22 @@ def run_mode(mode):
 
 def latest(pattern):
     fs=sorted(RESULTS.glob(pattern),key=lambda p:p.stat().st_mtime,reverse=True);return fs[0] if fs else None
-def topfile():return latest("Guru_Stock_Scanner_V10_CLOSE_*.xlsx") or latest("Guru_Stock_Scanner_V10_INTRADAY_*.xlsx")
-def afterfile():return latest("Guru_Stock_Scanner_V10_AFTER_*.xlsx")
+def topfile():
+    fs = [
+        p for p in RESULTS.glob("*.xlsx")
+        if "AFTER" not in p.name.upper()
+    ]
+    fs = sorted(fs, key=lambda p: p.stat().st_mtime, reverse=True)
+    return fs[0] if fs else None
+
+def afterfile():
+    fs = [
+        p for p in RESULTS.glob("*.xlsx")
+        if "AFTER" in p.name.upper()
+    ]
+    fs = sorted(fs, key=lambda p: p.stat().st_mtime, reverse=True)
+    return fs[0] if fs else None
+
 def won(v):
     try:return f"{float(v):,.0f}원"
     except:return "-"
