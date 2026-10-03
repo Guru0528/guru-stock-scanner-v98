@@ -2,6 +2,7 @@ import os,io,time,json,zipfile,traceback,re,math
 from pathlib import Path
 from datetime import datetime,timedelta
 from concurrent.futures import ThreadPoolExecutor,as_completed
+from threading import Lock
 import requests,pandas as pd,numpy as np
 from dotenv import load_dotenv
 from openpyxl import load_workbook
@@ -13,17 +14,32 @@ load_dotenv(ROOT/".env")
 KEY=os.getenv("KIS_APP_KEY","").strip(); SECRET=os.getenv("KIS_APP_SECRET","").strip()
 MODE=os.getenv("KIS_MODE","REAL").upper()
 BASE="https://openapi.koreainvestment.com:9443" if MODE=="REAL" else "https://openapivts.koreainvestment.com:29443"
-book=load_workbook(ROOT/"Guru_Stock_Scanner_V9_1_FIX.xlsx",data_only=True)
+book=load_workbook(ROOT/"Guru_Stock_Scanner_V10_CLOUD_PRO.xlsx",data_only=True)
 CFG={r[0]:r[1] for r in book["조건설정"].iter_rows(min_row=2,values_only=True) if r[0]}
 STAMP=datetime.now().strftime("%Y%m%d_%H%M%S");TOK=DATA/"token.json";ERR=LOGS/f"errors_{STAMP}.txt"
 PROGRESS=DATA/"scan_progress.json"
+
+# V10.1 - KIS API 안정화용 전역 호출 간격 제어
+_API_LOCK=Lock()
+_LAST_API_CALL=0.0
+def api_wait():
+    global _LAST_API_CALL
+    gap=float(CFG.get("REQUEST_SLEEP",0.12) or 0.12)
+    with _API_LOCK:
+        now=time.monotonic()
+        wait=gap-(now-_LAST_API_CALL)
+        if wait>0: time.sleep(wait)
+        _LAST_API_CALL=time.monotonic()
+
 def write_progress(**kw):
     base={"status":"running","time":datetime.now().isoformat(timespec="seconds")}
     base.update(kw)
     tmp=PROGRESS.with_suffix(".tmp")
     try:
-        tmp.write_text(json.dumps(base,ensure_ascii=False),encoding="utf-8"); tmp.replace(PROGRESS)
-    except Exception: pass
+        tmp.write_text(json.dumps(base,ensure_ascii=False),encoding="utf-8")
+        tmp.replace(PROGRESS)
+    except Exception:
+        pass
 
 def elog(s):
     with ERR.open("a",encoding="utf-8") as f:f.write(str(s)+"\n")
@@ -88,17 +104,22 @@ def fetch(code,tk,s,e):
     p={"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code,"FID_INPUT_DATE_1":s,"FID_INPUT_DATE_2":e,
        "FID_PERIOD_DIV_CODE":"D","FID_ORG_ADJ_PRC":"1"}
     last=""
-    for a in range(2):
-        time.sleep(float(CFG["REQUEST_SLEEP"]))
+    for a in range(3):
+        api_wait()
         try:
-            r=requests.get(BASE+"/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",headers=h,params=p,timeout=(5,15))
+            r=requests.get(BASE+"/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",headers=h,params=p,timeout=20)
             if r.status_code==200:
                 j=r.json()
-                if str(j.get("rt_cd"))=="0":return j.get("output2",[]),""
+                if str(j.get("rt_cd"))=="0": return j.get("output2",[]),""
                 last=f'{j.get("msg_cd","")} {j.get("msg1","")}'
-            else:last=f"HTTP {r.status_code}: {r.text[:150]}"
-        except Exception as ex:last=repr(ex)
-        time.sleep(.8*(a+1))
+                if any(x in last.lower() for x in ["초당","rate","limit","too many"]):
+                    time.sleep(1.0*(a+1)); continue
+            else:
+                last=f"HTTP {r.status_code}: {r.text[:150]}"
+                if r.status_code in (429,500,502,503,504):
+                    time.sleep(1.0*(a+1)); continue
+        except Exception as ex:
+            last=repr(ex); time.sleep(.8*(a+1))
     return [],last
 
 def history(code,tk):
@@ -251,38 +272,6 @@ def recommendation(final_score,conf):
     if final_score>=78:return "★★★☆☆ 관찰"
     return "★★☆☆☆ 보조후보"
 
-def close_trade_validation(technical_score, bt):
-    """종가매매용 후단 검증. V9.1 종목선정/기술점수/백테스트 원본은 변경하지 않는다."""
-    n=int(bt.get("bt_n") or 0)
-    # 작은 표본의 극단값(0%, 100%)을 그대로 믿지 않도록 50% 사전확률로 수축한다.
-    prior=12.0
-    def shrunk(rate):
-        if rate is None or (isinstance(rate,float) and math.isnan(rate)): return 0.50
-        return (float(rate)*n + 0.50*prior)/(n+prior)
-    p1=shrunk(bt.get("bt_next2"))
-    p3=shrunk(bt.get("bt_3d3"))
-    ps=shrunk(bt.get("bt_stop_first"))
-    evidence=100*(0.55*p1 + 0.15*p3 + 0.30*(1-ps))
-    reliability=min(1.0,n/30.0)
-    validation=50+(evidence-50)*reliability
-    sample_penalty=10 if n==0 else 7 if n<5 else 4 if n<10 else 2 if n<20 else 0
-    score=max(0,min(100,0.65*float(technical_score)+0.35*validation-sample_penalty))
-
-    raw1=bt.get("bt_next2"); rawstop=bt.get("bt_stop_first")
-    if n<5:
-        decision="검증부족"
-    elif rawstop is not None and float(rawstop)>=0.60:
-        decision="제외"
-    elif n>=20 and raw1 is not None and float(raw1)>=0.55 and float(rawstop)<=0.35 and score>=78:
-        decision="적극매수검토"
-    elif n>=10 and raw1 is not None and float(raw1)>=0.50 and float(rawstop)<=0.45 and score>=72:
-        decision="매수검토"
-    elif score>=65:
-        decision="관찰"
-    else:
-        decision="제외"
-    return round(score,1), round(validation,1), decision
-
 def analyze(item,tk):
     typ=security_type(item.name)
     b={"code":item.code,"name":item.name,"market":item.market,"security_type":typ,"api_ok":False,"bars":0,
@@ -313,7 +302,6 @@ def analyze(item,tk):
     bt=historical_stats(q);conf=bt_conf(int(bt["bt_n"]));bt_score=weighted_bt_score(bt)
     final_score=round(sc if bt_score is None else 0.80*sc+0.20*bt_score,1)
     hold=holding_type(bt);rec=recommendation(final_score,conf)
-    close_score,validation_score,close_decision=close_trade_validation(sc,bt)
     entry=float(x.close)
     stop=max(entry*(1-float(CFG["STOP_MAX_PCT"])),min(float(x.ma20)-float(x.atr14)*.5,entry-float(x.atr14)*float(CFG["STOP_ATR"])))
     b.update(date=x.date,close=entry,open=float(x.open),high=float(x.high),low=float(x.low),
@@ -329,64 +317,158 @@ def analyze(item,tk):
              day5_target=round(entry*(1+float(CFG["DAY5_TARGET_PCT"])),0),
              nextday_gap_limit=round(entry*(1+float(CFG["MAX_GAP_UP_PCT"])),0),
              bt_confidence=conf,bt_score=round(bt_score,1) if bt_score is not None else None,
-             final_recommend_score=final_score,holding_type=hold,recommendation=rec,
-             close_trade_score=close_score,validation_score=validation_score,close_decision=close_decision)
+             final_recommend_score=final_score,holding_type=hold,recommendation=rec)
     b.update(bt);b["fail_reason"]=" / ".join(fails);b["final_pass"]=not fails
     return b
 
 
+
+def fast_prefilter(row,tk):
+    """V10.2: 짧은 최근 구간으로 명백한 탈락만 먼저 제거."""
+    try:
+        # 상품 제외는 기존 analyze()와 동일하게 최종 단계에서도 다시 확인됨.
+        e=datetime.now().strftime("%Y%m%d")
+        s=(datetime.now()-timedelta(days=150)).strftime("%Y%m%d")
+        arr,err=fetch(str(row.code),tk,s,e)
+        if err or not arr:
+            return row,"API_ERROR"
+        d=frame(arr)
+        if d is None or len(d)<35:
+            return row,"DATA_SHORT"
+        d=enrich(d)
+        r=d.iloc[-1]
+        close=float(r["close"]); vol=float(r["volume"])
+        turn=float(close*vol)
+        # 1차 필터는 의도적으로 느슨하게: 명백한 저유동/약추세만 제외
+        if float(r.get("volume_ratio",1) or 1)<0.35: return row,"FAST_VOLUME"
+        if float(r.get("ma20",close) or close)>0 and close<float(r["ma20"])*0.88: return row,"FAST_TREND"
+        return row,"PASS"
+    except Exception:
+        return row,"API_ERROR"
+
 def close_scan():
     started=time.time()
-    write_progress(status="starting",phase="V9.1 원본검색",message="API 인증 및 종목목록 준비 중",done=0,total=0)
+    write_progress(status="starting",message="API 인증 및 종목목록 준비 중",done=0,total=0)
     tk=get_token();u=masters();limit=int(CFG["DIAGNOSTIC_LIMIT"] or 0)
     if limit>0:u=u.head(limit)
     total=len(u)
-    print(f"[V9.4 CLOSE TRADER / V9.1 ENGINE] 검색대상 {total:,}종목",flush=True)
-    write_progress(status="running",phase="V9.1 원본검색",message="V9.1 원본 조건으로 전 종목 검색 중",
-                   done=0,total=total,api_ok=0,api_fail=0,excluded=0,indicator_ok=0,pass_count=0,elapsed=0,eta=0)
+    print(f"[V10.2 FAST] 검색대상 {total:,}종목",flush=True)
+
+    # 1차 고속필터
+    pf_start=time.time(); pf_pass=[]; pf_retry=[]; pf_fail=0; pf_ex=0
+    write_progress(status="running",phase="1차 고속필터",message="최근 데이터로 후보 압축 중",
+                   done=0,total=total,api_ok=0,api_fail=0,excluded=0,indicator_ok=0,pass_count=0,elapsed=0,eta=0,reasons={})
+    # API 안정성을 위해 1차는 낮은 동시성 사용
+    with ThreadPoolExecutor(max_workers=2) as pex:
+        pfs=[pex.submit(fast_prefilter,r,tk) for r in u.itertuples(index=False)]
+        for i,f in enumerate(as_completed(pfs),1):
+            r,reason=f.result()
+            if reason=="PASS": pf_pass.append(r)
+            elif reason=="API_ERROR":
+                pf_fail+=1
+                pf_retry.append(r)
+            else: pf_ex+=1
+            if i%10==0 or i==total:
+                elapsed=int(time.time()-pf_start); eta=int((elapsed/max(i,1))*(total-i))
+                write_progress(status="running",phase="1차 고속필터",message="최근 데이터로 후보 압축 중",
+                    done=i,total=total,universe_total=total,phase_done=i,phase_total=total,overall_pct=int(i*50/max(total,1)),
+                    api_ok=i-pf_fail,api_fail=pf_fail,excluded=pf_ex,indicator_ok=0,
+                    pass_count=len(pf_pass),elapsed=elapsed,eta=eta,
+                    reasons={"1차통과":len(pf_pass),"1차제외":pf_ex,"API오류":pf_fail})
+
+    # API 오류 종목은 누락시키지 않고 기존 정밀분석에서 재시도
+    # 정상 통과 종목을 우선 정밀분석한다.
+    # 1차 API 오류 종목도 2차에서 반드시 재시도하여 누락을 방지한다.
+    phase2_rows=pf_pass+pf_retry
+    u2=pd.DataFrame([r._asdict() for r in phase2_rows]) if phase2_rows else u.head(0).copy()
+    if u2.empty:
+        u2=u.copy()
+    universe_total=total
+    total=len(u2)
+    phase2_total=total
+    phase2_start=time.time()
+    write_progress(status="running",phase="2차 정밀분석",message="1차 통과 종목 2년 분석/백테스트 중",
+                   done=0,total=total,universe_total=universe_total,phase_done=0,phase_total=phase2_total,overall_pct=50,
+                   api_ok=0,api_fail=0,excluded=pf_ex,indicator_ok=0,pass_count=0,elapsed=0,eta=0,
+                   reasons={"1차통과":len(pf_pass),"1차재시도":len(pf_retry),"1차제외":pf_ex})
     rows=[];ok=fail=ind=pas=excluded=0
-    with ThreadPoolExecutor(max_workers=int(CFG["MAX_WORKERS"])) as ex:
-        fs=[ex.submit(analyze,r,tk) for r in u.itertuples(index=False)]
+    with ThreadPoolExecutor(max_workers=max(1,min(int(CFG.get("MAX_WORKERS",4) or 4),6))) as ex:
+        fs=[ex.submit(analyze,r,tk) for r in u2.itertuples(index=False)]
         for i,f in enumerate(as_completed(fs),1):
             try:
                 z=f.result();rows.append(z);excluded+=int(str(z.get("fail_reason","")).startswith("EXCLUDED_"))
                 ok+=int(z["api_ok"]);fail+=int((not z["api_ok"]) and not str(z.get("fail_reason","")).startswith("EXCLUDED_"))
                 ind+=int(z["indicator_ok"]);pas+=int(z["final_pass"])
-            except Exception:fail+=1;elog(traceback.format_exc())
-            if i%10==0 or i==len(fs):
-                elapsed=int(time.time()-started);eta=int((elapsed/max(i,1))*(total-i)) if i else 0
-                print(f"{i:,}/{total:,} | API성공 {ok:,} 실패 {fail:,} | 제외 {excluded:,} | 지표 {ind:,} | PASS {pas:,}",flush=True)
-                write_progress(status="running",phase="V9.1 원본검색",message="V9.1 원본 조건으로 전 종목 검색 중",
-                               done=i,total=total,api_ok=ok,api_fail=fail,excluded=excluded,
-                               indicator_ok=ind,pass_count=pas,elapsed=elapsed,eta=eta,
-                               last_code=str(z.get("code", "")) if "z" in locals() else "",
-                               last_name=str(z.get("name", "")) if "z" in locals() else "")
+            except Exception:
+                fail+=1;elog(traceback.format_exc())
+            if i%10==0 or i==total:
+                elapsed=int(time.time()-phase2_start)
+                eta=int((elapsed/max(i,1))*(total-i)) if i else 0
+                reason_counts={}
+                for rr in rows:
+                    fr=str(rr.get("fail_reason","") or "")
+                    if not fr and rr.get("final_pass"): key="PASS"
+                    elif fr.startswith("EXCLUDED_"): key="상품제외"
+                    elif fr=="API_ERROR": key="API오류"
+                    elif fr: key=fr.split(" / ")[0]
+                    else: key="기타"
+                    reason_counts[key]=reason_counts.get(key,0)+1
+                top_reasons=dict(sorted(reason_counts.items(),key=lambda x:x[1],reverse=True)[:8])
+                print(f"{i:,}/{total:,} | API성공 {ok:,} 실패 {fail:,} | 제외 {excluded:,} | 지표 {ind:,} | PASS {pas:,} | ETA {eta//60:02d}:{eta%60:02d}",flush=True)
+                overall_pct=50+int(i*50/max(phase2_total,1))
+                write_progress(status="running",phase="2차 정밀분석",message="1차 통과/재시도 종목 2년 분석·백테스트 중",
+                    done=i,total=phase2_total,universe_total=universe_total,phase_done=i,phase_total=phase2_total,overall_pct=min(99,overall_pct),
+                    api_ok=ok,api_fail=fail,excluded=pf_ex+excluded,indicator_ok=ind,pass_count=pas,elapsed=elapsed,eta=eta,reasons=top_reasons)
     allx=pd.DataFrame(rows); cand=allx[allx.indicator_ok==True].copy() if not allx.empty else pd.DataFrame()
     if not cand.empty:cand=cand.sort_values(["final_pass","grade_rank","final_recommend_score","technical_score","turnover"],ascending=[False,True,False,False,False])
+    # V10: 시장 전체 과거표본을 이용한 2차 검증.
+    # 개별 종목의 표본이 적어도 같은 전략군의 시장 전체 과거 사례를 함께 보여준다.
+    if not allx.empty and "strategy" in allx.columns:
+        valid_bt=allx[(allx.get("bt_n",0).fillna(0)>0) & allx["strategy"].notna()].copy()
+        pooled={}
+        for strat,g in valid_bt.groupby("strategy"):
+            n=float(g["bt_n"].fillna(0).sum())
+            if n<=0: continue
+            def wavg(col):
+                x=g[[col,"bt_n"]].dropna()
+                return float((x[col]*x["bt_n"]).sum()/x["bt_n"].sum()) if len(x) and x["bt_n"].sum()>0 else None
+            pooled[strat]={"시장표본":int(n),"시장익일2":wavg("bt_next2"),"시장3일3":wavg("bt_3d3"),
+                           "시장5일5":wavg("bt_5d5"),"시장손절":wavg("bt_stop_first")}
+        def poolval(r,key):
+            return pooled.get(r.get("strategy"),{}).get(key)
+        allx["market_bt_n"]=allx.apply(lambda r:poolval(r,"시장표본"),axis=1)
+        allx["market_bt_next2"]=allx.apply(lambda r:poolval(r,"시장익일2"),axis=1)
+        allx["market_bt_3d3"]=allx.apply(lambda r:poolval(r,"시장3일3"),axis=1)
+        allx["market_bt_5d5"]=allx.apply(lambda r:poolval(r,"시장5일5"),axis=1)
+        allx["market_bt_stop"]=allx.apply(lambda r:poolval(r,"시장손절"),axis=1)
+        allx["validation_label"]=allx.apply(
+            lambda r:"강화검증" if (r.get("bt_n") or 0)>=30 else
+                     ("시장표본보완" if (r.get("market_bt_n") or 0)>=100 else "검증부족"),axis=1)
     top=allx[allx.final_pass==True].copy() if not allx.empty else pd.DataFrame()
     if not top.empty:
-        decision_rank={"적극매수검토":0,"매수검토":1,"관찰":2,"검증부족":3,"제외":4}
-        top["close_decision_rank"]=top["close_decision"].map(decision_rank).fillna(9)
-        top=top.sort_values(["close_decision_rank","close_trade_score","technical_score","turnover"],
-                            ascending=[True,False,False,False]).head(int(CFG["TOP_N"])).reset_index(drop=True)
+        top=top.sort_values(["grade_rank","final_recommend_score","technical_score","turnover"],ascending=[True,False,False,False]).head(int(CFG["TOP_N"])).reset_index(drop=True)
         top.insert(0,"rank",range(1,len(top)+1))
-    topmap={"rank":"순위","name":"종목명","code":"종목코드","market":"시장","grade":"등급","technical_score":"기술점수","final_recommend_score":"V9추천점수","close_trade_score":"종가매매점수","validation_score":"검증점수","close_decision":"최종판정",
-    "recommendation":"V9추천도","holding_type":"추천보유유형","strategy":"선정전략","close":"종가","entry_low":"매수구간하단",
+    topmap={"rank":"순위","name":"종목명","code":"종목코드","market":"시장","grade":"등급","final_recommend_score":"최종추천점수",
+    "recommendation":"추천도","holding_type":"추천보유유형","strategy":"선정전략","close":"종가","entry_low":"매수구간하단",
     "entry_high":"매수구간상단","stop":"손절가","nextday_target":"익일목표가","day3_target":"3일목표가","day5_target":"5일목표가",
     "nextday_gap_limit":"익일추격금지가","bt_confidence":"백테스트신뢰도","bt_n":"백테스트표본","bt_next2":"익일+2%선도달률",
-    "bt_3d3":"3일+3%선도달률","bt_5d5":"5일+5%선도달률","bt_stop_first":"손절선도달률"}
+    "bt_3d3":"3일+3%선도달률","bt_5d5":"5일+5%선도달률","bt_stop_first":"손절선도달률",
+    "validation_label":"검증등급","market_bt_n":"시장전략표본","market_bt_next2":"시장익일+2%","market_bt_3d3":"시장3일+3%",
+    "market_bt_5d5":"시장5일+5%","market_bt_stop":"시장손절률"}
     detailmap={"name":"종목명","code":"종목코드","market":"시장","date":"기준일","technical_score":"기술점수","final_recommend_score":"최종추천점수",
     "grade":"등급","strategy":"선정전략","close":"종가","ma5":"5일선","ma20":"20일선","ma60":"60일선","ma20_distance":"20일선이격률",
     "volume_ratio":"거래량배수","turnover":"거래대금(원)","rsi14":"RSI14","adx14":"ADX14","plus_di":"+DI","minus_di":"-DI","atr14":"ATR14",
     "atr_pct":"ATR비율","high20":"최근20일고점","high20_distance":"전고점거리","close_location":"종가강도","upper_wick_ratio":"윗꼬리비율",
     "bt_confidence":"백테스트신뢰도","bt_n":"백테스트표본","bt_next2":"익일+2%선도달률","bt_3d3":"3일+3%선도달률","bt_5d5":"5일+5%선도달률",
-    "bt_stop_first":"손절선도달률","bt_mfe5":"5일최대상승폭","bt_mae5":"5일최대하락폭","holding_type":"추천보유유형","recommendation":"추천도"}
+    "bt_stop_first":"손절선도달률","validation_label":"검증등급","market_bt_n":"시장전략표본",
+    "market_bt_next2":"시장익일+2%","market_bt_3d3":"시장3일+3%","market_bt_5d5":"시장5일+5%","market_bt_stop":"시장손절률",
+    "bt_mfe5":"5일최대상승폭","bt_mae5":"5일최대하락폭","holding_type":"추천보유유형","recommendation":"추천도"}
     topkr=top[[c for c in topmap if c in top.columns]].rename(columns=topmap) if not top.empty else pd.DataFrame(columns=list(topmap.values()))
     det=cand[[c for c in detailmap if c in cand.columns]].rename(columns=detailmap) if not cand.empty else pd.DataFrame(columns=list(detailmap.values()))
     summary=pd.DataFrame({"항목":["검색대상","상품제외","API성공","API실패","지표계산성공","최종후보","TOP출력"],"수량":[len(u),excluded,ok,fail,ind,pas,len(top)]})
     reasons=allx.fail_reason.fillna("").replace("","PASS").value_counts().reset_index() if not allx.empty else pd.DataFrame(columns=["탈락사유","건수"])
     if len(reasons.columns)==2:reasons.columns=["탈락사유","건수"]
-    mode_tag=os.getenv("SCANNER_MODE","CLOSE").upper(); path=RESULTS/f"Guru_Stock_Scanner_V9_1_{mode_tag}_{STAMP}.xlsx"
+    mode_tag=os.getenv("SCANNER_MODE","CLOSE").upper(); path=RESULTS/f"Guru_Stock_Scanner_V10_{mode_tag}_{STAMP}.xlsx"
     with pd.ExcelWriter(path,engine="openpyxl") as w:
         topkr.to_excel(w,index=False,sheet_name="TOP10_한눈에보기");det.to_excel(w,index=False,sheet_name="상세분석")
         summary.to_excel(w,index=False,sheet_name="실행요약");reasons.to_excel(w,index=False,sheet_name="탈락사유")
@@ -402,7 +484,7 @@ def close_scan():
         for i in range(1,ws.max_column+1):ws.column_dimensions[get_column_letter(i)].width=16
     ws=b["TOP10_한눈에보기"];ws.column_dimensions["B"].width=18;ws.column_dimensions["G"].width=22;ws.column_dimensions["I"].width=30
     hdr={c.value:c.column for c in ws[1]}
-    for h in ["익일+2%선도달률","3일+3%선도달률","5일+5%선도달률","손절선도달률"]:
+    for h in ["익일+2%선도달률","3일+3%선도달률","5일+5%선도달률","손절선도달률","시장익일+2%","시장3일+3%","시장5일+5%","시장손절률"]:
         if h in hdr:
             for r in range(2,ws.max_row+1):ws.cell(r,hdr[h]).number_format="0.0%"
     if "등급" in hdr:
@@ -417,9 +499,7 @@ def close_scan():
             v=ws.cell(r,hdr["손절선도달률"]).value
             if isinstance(v,(int,float)) and v>=.5:ws.cell(r,hdr["손절선도달률"]).fill=PatternFill("solid",fgColor="F4CCCC")
     b.active=0;b.save(path)
-    write_progress(status="done",phase="완료",message="V9.4 종가매매 랭킹 완료",done=total,total=total,
-                   api_ok=ok,api_fail=fail,excluded=excluded,indicator_ok=ind,pass_count=pas,
-                   top_count=len(top),elapsed=int(time.time()-started),eta=0,result=path.name)
+    write_progress(status="done",message="검색 완료",done=total,total=total,api_ok=ok,api_fail=fail,excluded=excluded,indicator_ok=ind,pass_count=pas,top_count=len(top),elapsed=int(time.time()-started),result=str(path.name))
     print("완료:",path,flush=True)
 
 
@@ -429,7 +509,7 @@ def current_price(code, tk):
     h={"authorization":"Bearer "+tk,"appkey":KEY,"appsecret":SECRET,"tr_id":"FHKST01010100","custtype":"P"}
     p={"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":str(code).zfill(6)}
     try:
-        time.sleep(float(CFG.get("CURRENT_PRICE_SLEEP",0.12)))
+        api_wait()
         r=requests.get(BASE+"/uapi/domestic-stock/v1/quotations/inquire-price",headers=h,params=p,timeout=20)
         if r.status_code!=200:return None,f"HTTP {r.status_code}"
         j=r.json()
@@ -441,10 +521,10 @@ def current_price(code, tk):
     except Exception as e:return None,repr(e)
 
 def latest_close_result():
-    files=sorted(RESULTS.glob("Guru_Stock_Scanner_V9_1_*CLOSE*.xlsx"),key=lambda p:p.stat().st_mtime,reverse=True)
+    files=sorted(RESULTS.glob("Guru_Stock_Scanner_V10_*CLOSE*.xlsx"),key=lambda p:p.stat().st_mtime,reverse=True)
     if not files:
         # compatibility: close_scan filename may not contain CLOSE in older runs
-        files=sorted(RESULTS.glob("Guru_Stock_Scanner_V9_1_MULTI_*.xlsx"),key=lambda p:p.stat().st_mtime,reverse=True)
+        files=sorted(RESULTS.glob("Guru_Stock_Scanner_V10_MULTI_*.xlsx"),key=lambda p:p.stat().st_mtime,reverse=True)
     return files[0] if files else None
 
 def after_scan():
@@ -475,7 +555,7 @@ def after_scan():
                      "종가대비등락률":chg,"애프터판정":judge,"추천보유유형":r.get("추천보유유형"),
                      "선정전략":r.get("선정전략"),"API메시지":msg})
     out=pd.DataFrame(rows)
-    path=RESULTS/f"Guru_Stock_Scanner_V9_1_AFTER_{STAMP}.xlsx"
+    path=RESULTS/f"Guru_Stock_Scanner_V10_AFTER_{STAMP}.xlsx"
     with pd.ExcelWriter(path,engine="openpyxl") as w:
         out.to_excel(w,index=False,sheet_name="애프터확인")
         top.to_excel(w,index=False,sheet_name="장마감TOP10")
@@ -515,4 +595,8 @@ def main():
 
 
 if __name__=="__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        write_progress(status="error",message=str(e),traceback=traceback.format_exc())
+        raise
