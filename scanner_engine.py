@@ -14,7 +14,7 @@ load_dotenv(ROOT/".env")
 KEY=os.getenv("KIS_APP_KEY","").strip(); SECRET=os.getenv("KIS_APP_SECRET","").strip()
 MODE=os.getenv("KIS_MODE","REAL").upper()
 BASE="https://openapi.koreainvestment.com:9443" if MODE=="REAL" else "https://openapivts.koreainvestment.com:29443"
-book=load_workbook(ROOT/"Guru_Stock_Scanner_V10_CLOUD_PRO.xlsx",data_only=True)
+book=load_workbook(ROOT/"Guru_Stock_Scanner_V9_1_FIX.xlsx",data_only=True)
 CFG={r[0]:r[1] for r in book["조건설정"].iter_rows(min_row=2,values_only=True) if r[0]}
 STAMP=datetime.now().strftime("%Y%m%d_%H%M%S");TOK=DATA/"token.json";ERR=LOGS/f"errors_{STAMP}.txt"
 PROGRESS=DATA/"scan_progress.json"
