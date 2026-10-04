@@ -446,6 +446,17 @@ def close_scan():
                      ("시장표본보완" if (r.get("market_bt_n") or 0)>=100 else "검증부족"),axis=1)
     top=allx[allx.final_pass==True].copy() if not allx.empty else pd.DataFrame()
     if not top.empty:
+        # 검증등급에 따른 최종추천점수 보정
+        top["validation_penalty"] = top["validation_label"].map({
+            "강화검증": 0,
+            "시장표본보완": -5,
+            "검증부족": -15
+        }).fillna(-15)
+
+        top["final_recommend_score"] = (
+            pd.to_numeric(top["final_recommend_score"], errors="coerce").fillna(0)
+            + top["validation_penalty"]
+        ).clip(lower=0)
         top=top.sort_values(["grade_rank","final_recommend_score","technical_score","turnover"],ascending=[True,False,False,False]).head(int(CFG["TOP_N"])).reset_index(drop=True)
         top.insert(0,"rank",range(1,len(top)+1))
     topmap={"rank":"순위","name":"종목명","code":"종목코드","market":"시장","grade":"등급","final_recommend_score":"최종추천점수",
