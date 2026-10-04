@@ -76,33 +76,37 @@ def run_mode(mode):
     if rc!=0:
         status_box.error("검색 중 오류가 발생했습니다.");bar.progress(0)
         return False,None,0,f"검색 오류 (코드 {rc})",out,out
-    # 검색 완료 후 가장 최근 생성/갱신된 결과파일 찾기
-files = sorted(
-    RESULTS.glob("*.xlsx"),
-    key=lambda p: p.stat().st_mtime,
-    reverse=True
-)
+     # 검색 완료 후 가장 최근 생성/갱신된 결과파일 찾기
+    files = sorted(
+        RESULTS.glob("*.xlsx"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
 
-if mode == "AFTER":
-    files = [p for p in files if "AFTER" in p.name.upper()]
-else:
-    files = [p for p in files if "AFTER" not in p.name.upper()]
+    if mode == "AFTER":
+        files = [p for p in files if "AFTER" in p.name.upper()]
+    else:
+        files = [p for p in files if "AFTER" not in p.name.upper()]
 
-result = files[0] if files else None
+    result = files[0] if files else None
+
     if not result:
         status_box.error("검색은 종료됐지만 새 결과파일이 없습니다.")
         return False,None,0,"검색은 종료됐지만 새 결과파일이 없습니다.",out,""
+
     try:
         sh="애프터확인" if mode=="AFTER" else "TOP10_한눈에보기"
         d=pd.read_excel(result,sheet_name=sh)
-        bar.progress(100);status_box.success(f"검색 완료 · TOP {len(d)}개 · 결과 저장 완료")
+        bar.progress(100)
+        status_box.success(f"검색 완료 · TOP {len(d)}개 · 결과 저장 완료")
         return True,result,len(d),f"{len(d)}개",out,""
     except Exception as ex:
         status_box.error("결과파일 검증 중 오류가 발생했습니다.")
         return False,result,0,f"결과 검증 실패: {ex}",out,""
 
 def latest(pattern):
-    fs=sorted(RESULTS.glob(pattern),key=lambda p:p.stat().st_mtime,reverse=True);return fs[0] if fs else None
+    fs=sorted(RESULTS.glob(pattern),key=lambda p:p.stat().st_mtime,reverse=True)
+    return fs[0] if fs else None  
 def topfile():
     fs = [
         p for p in RESULTS.glob("*.xlsx")
