@@ -76,9 +76,19 @@ def run_mode(mode):
     if rc!=0:
         status_box.error("검색 중 오류가 발생했습니다.");bar.progress(0)
         return False,None,0,f"검색 오류 (코드 {rc})",out,out
-    after={q.resolve() for q in RESULTS.glob("*.xlsx")}
-    created=sorted(after-before,key=lambda x:Path(x).stat().st_mtime,reverse=True)
-    result=Path(created[0]) if created else None
+    # 검색 완료 후 가장 최근 생성/갱신된 결과파일 찾기
+files = sorted(
+    RESULTS.glob("*.xlsx"),
+    key=lambda p: p.stat().st_mtime,
+    reverse=True
+)
+
+if mode == "AFTER":
+    files = [p for p in files if "AFTER" in p.name.upper()]
+else:
+    files = [p for p in files if "AFTER" not in p.name.upper()]
+
+result = files[0] if files else None
     if not result:
         status_box.error("검색은 종료됐지만 새 결과파일이 없습니다.")
         return False,None,0,"검색은 종료됐지만 새 결과파일이 없습니다.",out,""
