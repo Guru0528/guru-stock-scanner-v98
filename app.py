@@ -124,15 +124,33 @@ def afterfile():
     return fs[0] if fs else None
 
 def won(v):
-    try:return f"{float(v):,.0f}원"
-    except:return "-"
-def pct(v):
-def readtop():
-    p=topfile()
-    if not p:return p,pd.DataFrame()
-    try:return p,pd.read_excel(p,sheet_name="TOP10_한눈에보기",dtype={"종목코드":str})
-    except:return p,pd.DataFrame()
+    try:
+        if pd.isna(v):
+            return "-"
+        return f"{float(v):,.0f}원"
+    except:
+        return "-"
 
+def pct(v):
+    try:
+        if pd.isna(v):
+            return "표본없음"
+        return f"{float(v)*100:.1f}%"
+    except:
+        return "표본없음"
+
+def readtop():
+    p = topfile()
+    if not p:
+        return p, pd.DataFrame()
+    try:
+        return p, pd.read_excel(
+            p,
+            sheet_name="TOP10_한눈에보기",
+            dtype={"종목코드": str}
+        )
+    except:
+        return p, pd.DataFrame()
 st.title("GURU V10 CLOUD PRO")
 st.caption("종가매매 · 익일~5일 스윙 · 2중 백테스트 검증 · PC OFF 모바일")
 
