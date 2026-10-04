@@ -127,8 +127,6 @@ def won(v):
     try:return f"{float(v):,.0f}원"
     except:return "-"
 def pct(v):
-    try:return f"{float(v)*100:.1f}%"
-    except:return "-"
 def readtop():
     p=topfile()
     if not p:return p,pd.DataFrame()
